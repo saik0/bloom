@@ -1,34 +1,44 @@
-use crate::core::{ContentHash, NodeId, Span, SyntaxId, Spur};
-use crate::green::GreenNode;
 use ra_ap_syntax::{SourceFile, SyntaxNode};
 use ra_ap_syntax::Edition::Edition2021;
 use serde::{Deserialize, Serialize};
-use surrealdb::{engine::local::Mem, Surreal};
 use surrealdb::engine::local::Db;
-use surrealdb::sql::Thing;
+use surrealdb::Surreal;
 
-pub async fn parse_rust(db: &Surreal<Db>, source: &str, file_name: &str) -> Result<NodeId, String> {
-    // --- SYNCHRONOUS PHASE ---
-    // The !Send 'root' is confined to this block
-    let (flat_nodes, root_id) = {
+/// Tree node stored in SurrealDB - has both parent and children for bidirectional nav
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TreeNode {
+    pub kind: String,
+    pub text: String,
+    pub parent: Option<String>,   // Parent record ID (None for root)
+    pub children: Vec<String>,    // Child record IDs (actual IDs, not random!)
+    pub child_index: usize,       // This node's index within parent's children
+}
+
+/// Intermediate structure for building the tree synchronously
+struct PendingNode {
+    id: String,
+    node: TreeNode,
+}
+
+/// Parse Rust source and store tree in DB. Returns root node ID.
+pub async fn parse_rust(db: &Surreal<Db>, source: &str, _file_name: &str) -> Result<String, String> {
+    // SYNCHRONOUS PHASE: Walk the tree and build all nodes in memory
+    let (pending_nodes, root_id) = {
         let parsed = SourceFile::parse(source, Edition2021);
         let root = parsed.syntax_node();
 
-        let nodes = flatten_tree(&root);
-        let root_id = NodeId::root(file_name);
+        let mut pending = Vec::new();
+        let root_id = build_tree_sync(&root, None, 0, &mut pending);
 
-        (nodes, root_id)
-    }; // <--- 'root' is dropped here!
+        (pending, root_id)
+    };
+    // SyntaxNode is now dropped, safe to await
 
-    // --- ASYNCHRONOUS PHASE ---
-    // Now it is safe to use .await because the !Send data is gone
-    for node in flat_nodes {
-        let id = node.node_id.clone();
-
-        // Don't try to deserialize the response - just create and move on
-        let _: Option<FlatNode> = db
-            .create(("nodes", &id))
-            .content(node)
+    // ASYNC PHASE: Insert all nodes into DB
+    for pending in pending_nodes {
+        let _: Option<TreeNode> = db
+            .create(("nodes", &pending.id))
+            .content(pending.node)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -36,52 +46,78 @@ pub async fn parse_rust(db: &Surreal<Db>, source: &str, file_name: &str) -> Resu
     Ok(root_id)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FlatNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Thing>,  // SurrealDB's record ID
-    pub node_id: String,    // Our application ID
-    pub kind: String,
-    pub text: String,
-    pub children: Vec<String>,
+/// Synchronously walk the tree, building nodes bottom-up so children IDs are known
+fn build_tree_sync(
+    node: &SyntaxNode,
+    parent_id: Option<String>,
+    child_index: usize,
+    pending: &mut Vec<PendingNode>,
+) -> String {
+    // Generate ID for this node
+    let node_id = uuid::Uuid::new_v4().to_string();
+
+    // Recursively process children first to get their IDs
+    let child_ids: Vec<String> = node
+        .children()
+        .enumerate()
+        .map(|(idx, child)| build_tree_sync(&child, Some(node_id.clone()), idx, pending))
+        .collect();
+
+    // Now create this node with actual child IDs
+    let tree_node = TreeNode {
+        kind: format!("{:?}", node.kind()),
+        text: node.text().to_string(),
+        parent: parent_id,
+        children: child_ids,
+        child_index,
+    };
+
+    pending.push(PendingNode {
+        id: node_id.clone(),
+        node: tree_node,
+    });
+
+    node_id
 }
 
-fn flatten_tree(node: &SyntaxNode) -> Vec<FlatNode> {
-    let mut flat_nodes = Vec::new();
+/// Get a single node by ID - returns (id, node) tuple
+pub async fn get_node(db: &Surreal<Db>, id: &str) -> Result<(String, TreeNode), String> {
+    let mut result = db
+        .query("SELECT * FROM type::thing('nodes', $id)")
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // Simple recursive or iterative traversal
-    for child in node.children() {
-        flat_nodes.push(FlatNode {
-            id: None,  // SurrealDB will set this
-            node_id: uuid::Uuid::new_v4().to_string(),
-            kind: format!("{:?}", child.kind()),
-            text: child.text().to_string(),
-            children: child.children().map(|c| uuid::Uuid::new_v4().to_string()).collect(),
-        });
+    let node: Option<TreeNode> = result.take(0).map_err(|e| e.to_string())?;
+    let node = node.ok_or_else(|| format!("Node {} not found", id))?;
 
-        // Recurse
-        flat_nodes.extend(flatten_tree(&child));
+    Ok((id.to_string(), node))
+}
+
+/// Get children of a node by querying their IDs directly
+pub async fn get_children(db: &Surreal<Db>, parent_id: &str) -> Result<Vec<(String, TreeNode)>, String> {
+    // First get the parent to find child IDs
+    let (_, parent) = get_node(db, parent_id).await?;
+
+    // Fetch each child in order
+    let mut children = Vec::new();
+    for child_id in &parent.children {
+        match get_node(db, child_id).await {
+            Ok(child) => children.push(child),
+            Err(e) => eprintln!("Warning: couldn't fetch child {}: {}", child_id, e),
+        }
     }
 
-    flat_nodes
+    Ok(children)
 }
 
-// Optional helper for later querying
-pub async fn get_node(db: &Surreal<Db>, id: &str) -> Result<FlatNode, String> {
-    let node: Option<FlatNode> = db
-        .select(("nodes", id))
+/// Update node text
+pub async fn update_node_text(db: &Surreal<Db>, id: &str, new_text: String) -> Result<(), String> {
+    let _: Option<TreeNode> = db
+        .update(("nodes", id))
+        .merge(serde_json::json!({ "text": new_text }))
         .await
         .map_err(|e| e.to_string())?;
 
-    node.ok_or_else(|| format!("Node {} not found", id))
-}
-
-// Optional helper for querying all nodes
-pub async fn get_all_nodes(db: &Surreal<Db>) -> Result<Vec<FlatNode>, String> {
-    let nodes: Vec<FlatNode> = db
-        .select("nodes")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(nodes)
+    Ok(())
 }
