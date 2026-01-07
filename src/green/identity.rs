@@ -24,7 +24,7 @@ pub async fn upsert_identity(
 ) -> Result<(), String> {
     let _: Option<IdentityRecord> = db
         .update(("identity", record.salsa_id.as_str()))
-        .content(record)
+        .content(record.clone())
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -45,7 +45,7 @@ pub async fn upsert_source_root(
 ) -> Result<(), String> {
     let _: Option<SourceRootRecord> = db
         .update(("source_root", record.path.as_str()))
-        .content(record)
+        .content(record.clone())
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -91,9 +91,14 @@ pub async fn get_node_by_salsa_id(
         return Ok(None);
     };
 
-    db.select(node_id)
+    let mut result = db
+        .query("SELECT * FROM $node")
+        .bind(("node", node_id))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let mut rows: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
+    Ok(rows.pop())
 }
 
 pub async fn get_children_by_salsa_id(
