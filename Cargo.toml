@@ -6,11 +6,8 @@ edition = "2021"
 [dependencies]
 # UI
 iced = { version = "0.14.0", features = ["tokio", "wgpu"] }
-iced_wgpu = "0.14.0"
-# If direct HAL access is needed:
-wgpu-hal = "28.0"
 
-# Database
+# Database (side-channel for analytics, not source of truth)
 surrealdb = { version = "2.4", features = ["kv-mem"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -18,12 +15,12 @@ serde_json = "1.0"
 # Async
 tokio = { version = "1", features = ["full"] }
 
-# Phase 1: CST
+# Syntax tree (THE source of truth)
 ra_ap_syntax = "=0.0.230"
 
 # Core
-uuid = { version = "1.19", features = ["v5", "v7", "serde"] }
 blake3 = "1.8"
+hex = "0.4"
 
 [profile.dev]
 opt-level = 0

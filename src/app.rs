@@ -1,168 +1,116 @@
-use crate::parse::rust::{TreeNode, get_node, get_children, update_node_text};
+//! Bloom IDE Application
+//!
+//! # Architecture
+//!
+//! ```text
+//! rowan SyntaxNode (RED)     ←── Source of truth, editor state
+//!        ↓
+//!      Zipper               ←── Navigation cursor
+//!        ↓
+//!    UI renders             ←── Direct projection of rowan tree
+//!        
+//!        ↓ (async, background)
+//!        
+//!    SurrealDB (GREEN)      ←── Side-channel for analytics/RAG
+//! ```
+//!
+//! The rowan tree IS the editor. SurrealDB is for queries rowan can't do.
+
+use crate::parse;
 use crate::red::Zipper;
+use crate::green;
 use crate::ui::{render_viewport, Message};
 use iced::{Element, Task, Theme};
-use surrealdb::{engine::local::Mem, Surreal};
-use std::sync::Arc;
-use surrealdb::engine::local::Db;
+use ra_ap_syntax::SyntaxNode;
 
 pub struct BloomApp {
-    db: Option<Arc<Surreal<Db>>>,
+    /// The rowan syntax tree - THIS IS THE SOURCE OF TRUTH
+    _root: SyntaxNode,
+    
+    /// Navigation cursor into the rowan tree
     zipper: Zipper,
+    
+    /// Status message
     status: String,
-
-    // View cache
-    focused_node: Option<TreeNode>,
-    child_nodes: Vec<(String, TreeNode)>,
-
-    // Editing state
-    editing_node_id: Option<String>,
-    edit_buffer: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct InitResult {
-    pub db: Arc<Surreal<Db>>,
-    pub root_id: String,
 }
 
 impl BloomApp {
     pub fn new() -> (Self, Task<Message>) {
+        // Parse initial source - rowan is the source of truth
+        let source = r#"fn main() {
+    println!("Hello, Bloom!");
+    let x = 42;
+}
+"#;
+        let root = parse::parse_rust(source);
+        let zipper = Zipper::new(root.clone());
+        
+        // Extract projection data synchronously (SyntaxNode is !Send)
+        let (nodes, root_hash) = green::extract_projection(&root);
+
         let app = Self {
-            db: None,
-            zipper: Zipper::new("placeholder".to_string()),
-            status: "Initializing...".to_string(),
-            focused_node: None,
-            child_nodes: Vec::new(),
-            editing_node_id: None,
-            edit_buffer: String::new(),
+            _root: root,
+            zipper,
+            status: "Rowan ready ✅".to_string(),
         };
 
-        (app, Task::perform(init_app(), Message::Initialized))
+        // Insert into DB in background (the extracted data IS Send)
+        (app, Task::perform(
+            init_side_channel(nodes, root_hash),
+            |result| match result {
+                Ok(_) => Message::ProjectionComplete(Ok("DB synced".to_string())),
+                Err(e) => Message::ProjectionComplete(Err(e)),
+            }
+        ))
     }
 
     pub fn title(&self) -> String {
-        "Bloom IDE - Phase 2A: Inline Editing".to_string()
+        "Bloom IDE - Rowan is Truth".to_string()
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Initialized(result) => {
-                match result {
-                    Ok(init) => {
-                        self.db = Some(init.db.clone());
-                        self.zipper = Zipper::new(init.root_id.clone());
-                        self.status = "Ready ✅".to_string();
-
-                        // Load initial view at root
-                        let db = init.db.clone();
-                        let root_id = init.root_id;
-                        return Task::perform(
-                            async move { load_focus(db, root_id).await },
-                            Message::FocusLoaded
-                        );
-                    }
-                    Err(e) => {
-                        self.status = format!("Error: {}", e);
-                    }
-                }
-                Task::none()
-            }
-
-            Message::FocusLoaded(result) => {
-                match result {
-                    Ok((id, node, children)) => {
-                        self.focused_node = Some(node);
-                        self.child_nodes = children;
-                        self.status = format!(
-                            "Depth {} | {} children",
-                            self.zipper.depth(),
-                            self.child_nodes.len()
-                        );
-                    }
-                    Err(e) => {
-                        self.status = format!("Load error: {}", e);
-                    }
-                }
-                Task::none()
-            }
-
             Message::NavigateUp => {
                 if self.zipper.up() {
-                    // Successfully moved up
-                    if let Some(db) = &self.db {
-                        let db = db.clone();
-                        let focus_id = self.zipper.focus.clone();
-                        self.status = "Navigating up...".to_string();
-                        return Task::perform(
-                            async move { load_focus(db, focus_id).await },
-                            Message::FocusLoaded
-                        );
-                    }
+                    self.status = format!("Depth {}", self.zipper.depth());
                 } else {
                     self.status = "Already at root".to_string();
                 }
                 Task::none()
             }
 
-            Message::NavigateDown(child_id, child_index) => {
-                // Move zipper down
-                self.zipper.down(child_id.clone(), child_index);
-
-                if let Some(db) = &self.db {
-                    let db = db.clone();
-                    self.status = "Navigating down...".to_string();
-                    return Task::perform(
-                        async move { load_focus(db, child_id).await },
-                        Message::FocusLoaded
-                    );
+            Message::NavigateDown(child_index) => {
+                if self.zipper.down(child_index) {
+                    self.status = format!("Depth {}", self.zipper.depth());
+                } else {
+                    self.status = "No such child".to_string();
                 }
                 Task::none()
             }
 
-            Message::StartEdit(node_id) => {
-                // Find the node in child_nodes
-                if let Some((_, node)) = self.child_nodes.iter().find(|(id, _)| *id == node_id) {
-                    self.editing_node_id = Some(node_id);
-                    self.edit_buffer = node.text.clone();
-                    self.status = "Editing...".to_string();
+            Message::NextSibling => {
+                if self.zipper.next_sibling() {
+                    self.status = "→ Next".to_string();
+                } else {
+                    self.status = "No next sibling".to_string();
                 }
                 Task::none()
             }
 
-            Message::UpdateEditText(text) => {
-                self.edit_buffer = text;
-                Task::none()
-            }
-
-            Message::CommitEdit => {
-                if let (Some(node_id), Some(db)) = (&self.editing_node_id, &self.db) {
-                    let node_id_clone = node_id.clone();
-                    let new_text = self.edit_buffer.clone();
-                    let db = db.clone();
-                    let focus_id = self.zipper.focus.clone();
-
-                    // Clear editing state
-                    self.editing_node_id = None;
-                    self.edit_buffer.clear();
-                    self.status = "Saving edit...".to_string();
-
-                    // Update node in background, then refresh view
-                    return Task::perform(
-                        async move {
-                            update_node_text(&db, &node_id_clone, new_text).await?;
-                            load_focus(db, focus_id).await
-                        },
-                        Message::FocusLoaded
-                    );
+            Message::PrevSibling => {
+                if self.zipper.prev_sibling() {
+                    self.status = "← Prev".to_string();
+                } else {
+                    self.status = "No prev sibling".to_string();
                 }
                 Task::none()
             }
 
-            Message::CancelEdit => {
-                self.editing_node_id = None;
-                self.edit_buffer.clear();
-                self.status = "Edit cancelled".to_string();
+            Message::ProjectionComplete(result) => {
+                match result {
+                    Ok(msg) => self.status = format!("✅ {}", msg),
+                    Err(e) => self.status = format!("⚠️ DB: {}", e),
+                }
                 Task::none()
             }
 
@@ -171,23 +119,7 @@ impl BloomApp {
     }
 
     pub fn view(&self) -> Element<Message> {
-        if self.db.is_some() {
-            render_viewport(
-                &self.zipper,
-                &self.focused_node,
-                &self.child_nodes,
-                &self.editing_node_id,
-                &self.edit_buffer,
-                &self.status,
-            )
-        } else {
-            iced::widget::container(
-                iced::widget::text(&self.status)
-                    .size(20)
-            )
-                .center(iced::Fill)
-                .into()
-        }
+        render_viewport(&self.zipper, &self.status)
     }
 
     pub fn theme(&self) -> Theme {
@@ -195,7 +127,13 @@ impl BloomApp {
     }
 }
 
-async fn init_app() -> Result<InitResult, String> {
+/// Initialize the side-channel database and insert pre-extracted projection
+async fn init_side_channel(
+    nodes: Vec<green::projection::ProjectedNode>,
+    root_hash: String,
+) -> Result<(), String> {
+    use surrealdb::{engine::local::Mem, Surreal};
+    
     let db = Surreal::new::<Mem>(())
         .await
         .map_err(|e| e.to_string())?;
@@ -204,34 +142,14 @@ async fn init_app() -> Result<InitResult, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let schema = include_str!("green/schema.surql");
-    db.query(schema)
+    db.query(green::SCHEMA)
         .await
         .map_err(|e| e.to_string())?;
 
-    let source = r#"fn main() {
-    println!("Hello, Bloom!");
-    let x = 42;
-}
-"#;
+    // Insert pre-extracted projection
+    green::insert_projection(&db, nodes, "main.rs".to_string(), root_hash).await?;
 
-    let root_id = crate::parse::parse_rust(&db, source, "test.rs")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(InitResult {
-        db: Arc::new(db),
-        root_id,
-    })
-}
-
-async fn load_focus(
-    db: Arc<Surreal<Db>>,
-    focus_id: String,
-) -> Result<(String, TreeNode, Vec<(String, TreeNode)>), String> {
-    let (id, node) = get_node(&db, &focus_id).await?;
-    let children = get_children(&db, &focus_id).await?;
-    Ok((id, node, children))
+    Ok(())
 }
 
 pub fn run() -> iced::Result {

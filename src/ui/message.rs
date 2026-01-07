@@ -1,24 +1,14 @@
-use crate::app::InitResult;
-use crate::parse::rust::TreeNode;
-
 #[derive(Debug, Clone)]
 pub enum Message {
-    // Initialization
-    Initialized(Result<InitResult, String>),
-
-    // Focus loaded: (focused_node, children)
-    FocusLoaded(Result<(String, TreeNode, Vec<(String, TreeNode)>), String>),
-
-    // Navigation
+    // Navigation - these operate on the rowan tree directly
     NavigateUp,
-    NavigateDown(String, usize),  // (child_id, child_index)
+    NavigateDown(usize),  // child index
+    NextSibling,
+    PrevSibling,
 
-    // Editing
-    StartEdit(String),
-    UpdateEditText(String),
-    CommitEdit,
-    CancelEdit,
-
+    // Projection status (background task)
+    ProjectionComplete(Result<String, String>),
+    
     // No-op
     None,
 }

@@ -1,6 +1,5 @@
-mod core;
-mod green;
 mod red;
+mod green;
 mod parse;
 mod ui;
 mod app;

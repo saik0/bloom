@@ -5,5 +5,3 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
-Thumbs.db
-bloom.db/
