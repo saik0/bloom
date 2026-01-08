@@ -23,3 +23,12 @@ DEFINE FIELD text ON intern_string TYPE string;
 
 -- Index
 DEFINE INDEX text_unique ON intern_string FIELDS text UNIQUE;
+
+-- IDENTITY MAPPING
+DEFINE TABLE identity SCHEMAFULL;
+DEFINE FIELD salsa_id ON identity TYPE string;
+DEFINE FIELD node_id ON identity TYPE string;
+
+-- Indices
+DEFINE INDEX identity_salsa_idx ON identity FIELDS salsa_id UNIQUE;
+DEFINE INDEX identity_node_idx ON identity FIELDS node_id;
