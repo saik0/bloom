@@ -1,4 +1,5 @@
 use crate::app::InitResult;
+use crate::green::LiveUpdate;
 use crate::parse::rust::TreeNode;
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,10 @@ pub enum Message {
     UpdateEditText(String),
     CommitEdit,
     CancelEdit,
+
+    // Live updates
+    LiveUpdate(LiveUpdate),
+    SubscriptionsUpdated(Result<(), String>),
 
     // No-op
     None,

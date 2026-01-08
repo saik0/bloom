@@ -1,3 +1,4 @@
+use crate::green::SubscriptionManager;
 use crate::parse::rust::{TreeNode, get_node, get_children, update_node_text};
 use crate::red::Zipper;
 use crate::ui::{render_viewport, Message};
@@ -14,6 +15,10 @@ pub struct BloomApp {
     // View cache
     focused_node: Option<TreeNode>,
     child_nodes: Vec<(String, TreeNode)>,
+
+    // Live subscriptions
+    subscriptions: Option<SubscriptionManager>,
+    listening_for_updates: bool,
 
     // Editing state
     editing_node_id: Option<String>,
@@ -34,6 +39,8 @@ impl BloomApp {
             status: "Initializing...".to_string(),
             focused_node: None,
             child_nodes: Vec::new(),
+            subscriptions: None,
+            listening_for_updates: false,
             editing_node_id: None,
             edit_buffer: String::new(),
         };
@@ -51,6 +58,7 @@ impl BloomApp {
                 match result {
                     Ok(init) => {
                         self.db = Some(init.db.clone());
+                        self.subscriptions = Some(SubscriptionManager::new(init.db.clone()));
                         self.zipper = Zipper::new(init.root_id.clone());
                         self.status = "Ready ✅".to_string();
 
@@ -72,6 +80,7 @@ impl BloomApp {
             Message::FocusLoaded(result) => {
                 match result {
                     Ok((id, node, children)) => {
+                        let parent_node = node.parent.clone();
                         self.focused_node = Some(node);
                         self.child_nodes = children;
                         self.status = format!(
@@ -79,6 +88,30 @@ impl BloomApp {
                             self.zipper.depth(),
                             self.child_nodes.len()
                         );
+
+                        let mut tasks = Vec::new();
+                        if let Some(subscriptions) = &self.subscriptions {
+                            let focus_id = id.clone();
+                            let focus_node_id = id;
+                            let ancestors = self
+                                .zipper
+                                .path_ids()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect();
+                            tasks.push(subscriptions.subscribe_slice_task(
+                                focus_id,
+                                focus_node_id,
+                                parent_node,
+                                ancestors,
+                            ));
+                            if !self.listening_for_updates {
+                                self.listening_for_updates = true;
+                                tasks.push(subscriptions.listen_task());
+                            }
+                        }
+
+                        return Task::batch(tasks);
                     }
                     Err(e) => {
                         self.status = format!("Load error: {}", e);
@@ -88,16 +121,21 @@ impl BloomApp {
             }
 
             Message::NavigateUp => {
+                let mut tasks = Vec::new();
+                if let Some(subscriptions) = &self.subscriptions {
+                    tasks.push(subscriptions.unsubscribe_task());
+                }
                 if self.zipper.up() {
                     // Successfully moved up
                     if let Some(db) = &self.db {
                         let db = db.clone();
                         let focus_id = self.zipper.focus.clone();
                         self.status = "Navigating up...".to_string();
-                        return Task::perform(
+                        tasks.push(Task::perform(
                             async move { load_focus(db, focus_id).await },
                             Message::FocusLoaded
-                        );
+                        ));
+                        return Task::batch(tasks);
                     }
                 } else {
                     self.status = "Already at root".to_string();
@@ -106,16 +144,21 @@ impl BloomApp {
             }
 
             Message::NavigateDown(child_id, child_index) => {
+                let mut tasks = Vec::new();
+                if let Some(subscriptions) = &self.subscriptions {
+                    tasks.push(subscriptions.unsubscribe_task());
+                }
                 // Move zipper down
                 self.zipper.down(child_id.clone(), child_index);
 
                 if let Some(db) = &self.db {
                     let db = db.clone();
                     self.status = "Navigating down...".to_string();
-                    return Task::perform(
+                    tasks.push(Task::perform(
                         async move { load_focus(db, child_id).await },
                         Message::FocusLoaded
-                    );
+                    ));
+                    return Task::batch(tasks);
                 }
                 Task::none()
             }
@@ -163,6 +206,31 @@ impl BloomApp {
                 self.editing_node_id = None;
                 self.edit_buffer.clear();
                 self.status = "Edit cancelled".to_string();
+                Task::none()
+            }
+
+            Message::LiveUpdate(update) => {
+                self.status = format!("Live update: {:?}", update);
+
+                let mut tasks = Vec::new();
+                if let Some(db) = &self.db {
+                    let db = db.clone();
+                    let focus_id = self.zipper.focus.clone();
+                    tasks.push(Task::perform(
+                        async move { load_focus(db, focus_id).await },
+                        Message::FocusLoaded,
+                    ));
+                }
+                if let Some(subscriptions) = &self.subscriptions {
+                    tasks.push(subscriptions.listen_task());
+                }
+                Task::batch(tasks)
+            }
+
+            Message::SubscriptionsUpdated(result) => {
+                if let Err(error) = result {
+                    self.status = format!("Subscription error: {}", error);
+                }
                 Task::none()
             }
 
