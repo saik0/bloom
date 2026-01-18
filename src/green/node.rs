@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::core::{ContentHash, Span, SyntaxId, Spur};
 use serde::{Deserialize, Serialize};
 

@@ -47,6 +47,7 @@ impl Zipper {
     }
 
     /// Get the path as a list of node IDs (for breadcrumb display)
+    #[allow(dead_code)]
     pub fn path_ids(&self) -> Vec<&str> {
         self.path.iter().map(|c| c.node_id.as_str()).collect()
     }

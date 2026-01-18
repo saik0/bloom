@@ -71,7 +71,7 @@ impl BloomApp {
 
             Message::FocusLoaded(result) => {
                 match result {
-                    Ok((id, node, children)) => {
+                    Ok((_id, node, children)) => {
                         self.focused_node = Some(node);
                         self.child_nodes = children;
                         self.status = format!(
@@ -170,7 +170,7 @@ impl BloomApp {
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         if self.db.is_some() {
             render_viewport(
                 &self.zipper,
