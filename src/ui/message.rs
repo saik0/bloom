@@ -20,5 +20,6 @@ pub enum Message {
     CancelEdit,
 
     // No-op
+    #[allow(dead_code)]
     None,
 }
